@@ -2,16 +2,23 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import cors from "cors";
-import express from "express";
 import multer from "multer";
+import express from "express";
+import formidable from "formidable";
 
 const app = express();
-const port = 5000;
+const port = process.env.PORT || 5000;
 
+// --- Config ---
 app.use(cors());
 app.use(express.json());
+app.use(express.static(new URL("../public", import.meta.url).pathname)); // serve frontend
 
-// Set up Multer for file uploads
+const API_KEY = process.env.GEMINI_API_KEY; // <-- from .env
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || "gemini-2.5-flash-preview-05-20"; // audio-capable
+
+
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
@@ -39,12 +46,169 @@ const systemInstruction2 = `
         Your response must be a JSON object with the keys "score", and "feedback". The value for each key should be the generated speech text for that specific band. Do not include any additional text, analysis, or introductory phrases.
     `;
 
-// Replace with your actual Gemini API key if you're not in the canvas environment
-// In the canvas environment, this will be automatically provided.
-const API_KEY = process.env.GEMINI_API_KEY;
-const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${API_KEY}`;
 
-// Main endpoint to handle audio analysis
+// Helper: turn a file (from formidable) to base64 inlineData part
+const fileToInlinePart = async (f) => {
+  const fs = await import("node:fs/promises");
+  const buf = await fs.readFile(f.filepath || f._writeStream?.path || f.path);
+  return {
+    inlineData: {
+      mimeType: f.mimetype || "audio/webm",
+      data: buf.toString("base64"),
+    },
+  };
+};
+
+// --- API ROUTES ---
+app.get("/start-test", async (req, res) => {
+  try {
+    const systemPrompt = `
+      You are an expert IELTS examiner. Create a complete set of IELTS Speaking questions in JSON with keys part1, part2, part3.
+      - Part 1: 3–4 short questions on everyday topics
+      - Part 2: ONE cue card (long turn 1–2 minutes)
+      - Part 3: 3–4 deeper, abstract follow-ups connected to Part 2
+      Each question object MUST include { "question": string, "part": 1|2|3 }.
+      Do NOT ask the user to show or demonstrate anything.
+    `;
+
+    const payload = {
+      contents: [{ parts: [{ text: "Generate a full set of IELTS Speaking test questions." }] }],
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: "OBJECT",
+          properties: {
+            part1: {
+              type: "ARRAY",
+              items: {
+                type: "OBJECT",
+                properties: {
+                  question: { type: "STRING" },
+                  part: { type: "INTEGER" },
+                },
+              },
+            },
+            part2: {
+              type: "ARRAY",
+              items: {
+                type: "OBJECT",
+                properties: {
+                  question: { type: "STRING" },
+                  part: { type: "INTEGER" },
+                },
+              },
+            },
+            part3: {
+              type: "ARRAY",
+              items: {
+                type: "OBJECT",
+                properties: {
+                  question: { type: "STRING" },
+                  part: { type: "INTEGER" },
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`;
+
+    const apiResponse = await fetch(apiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!apiResponse.ok) throw new Error(`API error: ${apiResponse.status} ${apiResponse.statusText}`);
+
+    const data = await apiResponse.json();
+    const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    const questions = JSON.parse(jsonText);
+    return res.json(questions);
+  } catch (err) {
+    console.error("/start-test error:", err);
+    return res.status(500).json({ error: "Failed to generate test questions." });
+  }
+});
+
+app.post("/analyze-ielts-audio", async (req, res) => {
+  const form = formidable({ multiples: true });
+
+  try {
+    const [fields, files] = await form.parse(req);
+
+    const parts = [];
+    const indices = Object.keys(files)
+      .filter((k) => k.startsWith("audio_part_"))
+      .map((k) => Number(k.split("_")[2]))
+      .sort((a, b) => a - b);
+
+    for (const i of indices) {
+      const qField = fields[`question_part_${i}`]?.[0];
+      const qObj = qField ? JSON.parse(qField) : { question: `Question ${i + 1}` };
+      parts.push({ text: `Question ${i + 1}: ${qObj.question}` });
+
+      const file = files[`audio_part_${i}`]?.[0];
+      if (file) parts.push(await fileToInlinePart(file));
+    }
+
+    const systemPrompt = `
+      You are a world-class IELTS Speaking examiner. Analyze the user's performance using the uploaded audio clips.
+      Provide a JSON object with:
+      {
+        "user_score": 1..9,
+        "feedback": {
+          "fluency_and_coherence": {"assessment": string, "band_9_characteristics": string},
+          "lexical_resource": {"assessment": string, "band_9_characteristics": string},
+          "grammatical_range_and_accuracy": {"assessment": string, "band_9_characteristics": string},
+          "pronunciation": {"assessment": string, "band_9_characteristics": string},
+          "overall_feedback": string
+        }
+      }
+      Only return JSON — no prose outside the JSON.
+    `;
+
+    const payload = {
+      contents: [{ parts }],
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      generationConfig: { responseMimeType: "application/json" },
+    };
+
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`;
+    const apiResponse = await fetch(apiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!apiResponse.ok) throw new Error(`API error: ${apiResponse.status} ${apiResponse.statusText}`);
+
+    const data = await apiResponse.json();
+    const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!jsonText) {
+      return res.status(500).json({ error: "No analysis returned from model." });
+    }
+
+    let analysis;
+    try {
+      analysis = JSON.parse(jsonText);
+    } catch (e) {
+      console.error("JSON parse failed:", jsonText);
+      return res.status(500).json({ error: "Invalid JSON from model." });
+    }
+
+    return res.json(analysis);
+  } catch (err) {
+    console.error("/analyze-ielts-audio error:", err);
+    return res.status(500).json({ error: "Failed to analyze audio." });
+  }
+});
+
+
 app.post('/analyze-speech', upload.single('audio'), async (req, res) => {
     // Check if a file was uploaded
     if (!req.file) {
@@ -85,6 +249,8 @@ app.post('/analyze-speech', upload.single('audio'), async (req, res) => {
     let retries = 0;
 
     // Implement a simple retry mechanism with exponential backoff
+    const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${API_KEY}`;
+
     while (retries < maxRetries) {
         try {
             apiResponse = await fetch(API_URL, {
@@ -128,6 +294,7 @@ app.post('/analyze-speech', upload.single('audio'), async (req, res) => {
         res.status(500).json({ error: 'Failed to parse API response.' });
     }
 });
+
 
 app.post('/checkband', upload.single('audio'), async (req, res) => {
     // Check if a file was uploaded
@@ -172,6 +339,9 @@ app.post('/checkband', upload.single('audio'), async (req, res) => {
     let retries = 0;
 
     // Implement a simple retry mechanism with exponential backoff
+
+    const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${API_KEY}`;
+
     while (retries < maxRetries) {
         try {
             apiResponse = await fetch(API_URL, {
@@ -216,8 +386,6 @@ app.post('/checkband', upload.single('audio'), async (req, res) => {
     }
 });
 
-
-// Start the server
 app.listen(port, () => {
-    console.log(`Server listening at https://ielts-speaking.onrender.com:${port}`);
+  console.log(`Server listening at https://ielts-speaking.onrender.com:${port}`);
 });
